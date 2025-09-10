@@ -207,30 +207,65 @@ class EmailMonitor:
         return text_content.strip()
     
     def send_telegram_message(self, message):
-        """Send message to Telegram"""
-        try:
-            # Telegram has a 4096 character limit per message
-            if len(message) > 4000:
-                message = message[:4000] + "\n\n... (message truncated)"
-            
-            payload = {
-                'chat_id': self.telegram_chat_id,
-                'text': message,
-                'parse_mode': 'HTML'
-            }
-            
-            response = requests.post(self.telegram_url, data=payload, timeout=10)
-            
-            if response.status_code == 200:
-                logger.info("Message sent to Telegram successfully")
-                return True
-            else:
-                logger.error(f"Failed to send Telegram message: {response.status_code} - {response.text}")
-                return False
+        """Send message to Telegram with retry logic"""
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                # Telegram has a 4096 character limit per message
+                if len(message) > 4000:
+                    message = message[:4000] + "\n\n... (message truncated)"
                 
-        except Exception as e:
-            logger.error(f"Error sending Telegram message: {e}")
-            return False
+                payload = {
+                    'chat_id': self.telegram_chat_id,
+                    'text': message,
+                    'parse_mode': 'HTML'
+                }
+                
+                response = requests.post(self.telegram_url, data=payload, timeout=30)
+                
+                if response.status_code == 200:
+                    logger.info("Message sent to Telegram successfully")
+                    return True
+                else:
+                    logger.error(f"Failed to send Telegram message: {response.status_code} - {response.text}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Retrying in {retry_delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                        time.sleep(retry_delay)
+                        continue
+                    return False
+                    
+            except requests.exceptions.ConnectionError as e:
+                logger.error(f"Connection error to Telegram API (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error("All connection attempts to Telegram failed - network may be temporarily unavailable")
+                    return False
+                    
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Timeout error sending Telegram message (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    logger.error("All attempts to send Telegram message timed out")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error sending Telegram message (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    return False
+        
+        return False
     
     def check_emails(self):
         """Check for new emails from monitored senders"""
@@ -308,14 +343,25 @@ class EmailMonitor:
                             telegram_message += "\n\n... (content truncated)"
                         
                         # Send to Telegram
-                        if self.send_telegram_message(telegram_message):
-                            # Mark as read and add to processed list
+                        telegram_success = self.send_telegram_message(telegram_message)
+                        
+                        if telegram_success:
+                            # Mark as read and add to processed list only if Telegram succeeded
                             mail.store(email_id, '+FLAGS', '\\Seen')
                             self.processed_emails.add(email_id_str)
                             new_emails_processed += 1
                             logger.info(f"Email processed and marked as read: {subject}")
                         else:
-                            logger.error(f"Failed to send Telegram message for email: {subject}")
+                            # If Telegram fails, still mark as processed to avoid infinite retries
+                            # But don't mark as read in case we want to retry later
+                            self.processed_emails.add(email_id_str)
+                            logger.warning(f"Telegram delivery failed for email: {subject}")
+                            logger.warning("Email marked as processed to prevent spam, but not marked as read")
+                            
+                            # Send a simplified retry notification if possible
+                            simple_msg = f"⚠️ Email delivery failed\nFrom: {sender}\nSubject: {subject}\nCheck logs for details."
+                            if self.send_telegram_message(simple_msg):
+                                logger.info("Sent simplified failure notification")
                     else:
                         # Add to processed list even if not from monitored sender
                         self.processed_emails.add(email_id_str)
@@ -342,10 +388,28 @@ class EmailMonitor:
             except:
                 pass
     
+    def test_network_connectivity(self):
+        """Test network connectivity to external services"""
+        try:
+            # Test connection to Telegram API
+            response = requests.get('https://api.telegram.org', timeout=10)
+            logger.info("✅ Network connectivity to Telegram API: OK")
+            return True
+        except requests.exceptions.ConnectionError:
+            logger.error("❌ Network connectivity to Telegram API: FAILED")
+            logger.error("This may be a temporary network issue on the hosting platform")
+            return False
+        except Exception as e:
+            logger.error(f"Network connectivity test failed: {e}")
+            return False
     def send_startup_notification(self):
         """Send startup notification to Telegram"""
         try:
             import html
+            
+            # Test network connectivity first
+            if not self.test_network_connectivity():
+                logger.warning("⚠️ Network connectivity issues detected - startup notification may fail")
             
             # Get current time
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -444,6 +508,9 @@ class EmailMonitor:
                 return
         
         # Send startup notification ONCE when service starts
+        logger.info("Testing network connectivity...")
+        self.test_network_connectivity()
+        
         logger.info("Sending startup notification...")
         if not self.send_startup_notification():
             logger.warning("Failed to send startup notification, but continuing...")
