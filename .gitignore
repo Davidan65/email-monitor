@@ -1,5 +1,4 @@
 # Email Monitor - Ignore sensitive configuration
-config.py
 .env
 *.log
 processed_emails.pkl
