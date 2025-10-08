@@ -15,10 +15,28 @@ if os.path.exists('.env'):
 else:
     print("No .env file found - using system environment variables (normal for cloud deployment)")
 
-# Gmail IMAP Settings
+# Gmail IMAP Settings - Multiple Accounts Support
 IMAP_SERVER = "imap.gmail.com"
+
+# Multiple Gmail accounts (format: email:password,email:password)
+GMAIL_ACCOUNTS = os.getenv("GMAIL_ACCOUNTS", "")
+
+# Backward compatibility - single account support
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+
+# Parse multiple accounts or fall back to single account
+if GMAIL_ACCOUNTS:
+    # Parse multiple accounts format: email1:password1,email2:password2
+    account_pairs = [pair.strip() for pair in GMAIL_ACCOUNTS.split(',') if pair.strip()]
+    ACCOUNTS = {}
+    for pair in account_pairs:
+        if ':' in pair:
+            email, password = pair.split(':', 1)
+            ACCOUNTS[email.strip()] = password.strip()
+else:
+    # Single account mode (backward compatibility)
+    ACCOUNTS = {EMAIL_USER: EMAIL_PASSWORD} if EMAIL_USER and EMAIL_PASSWORD else {}
 
 # Telegram Bot Settings
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -35,12 +53,20 @@ CHECK_INTERVAL_MINUTES = float(os.getenv("CHECK_INTERVAL_MINUTES", "0.25"))  # 1
 
 # Validate required environment variables
 required_vars = {
-    'EMAIL_USER': EMAIL_USER,
-    'EMAIL_PASSWORD': EMAIL_PASSWORD,
     'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
     'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
     'MONITORED_SENDERS': os.getenv("MONITORED_SENDERS")
 }
+
+# Check for accounts
+if not ACCOUNTS:
+    required_vars['EMAIL_USER'] = EMAIL_USER
+    required_vars['EMAIL_PASSWORD'] = EMAIL_PASSWORD
+    print("ERROR: No Gmail accounts configured.")
+    print("Please set either:")
+    print("  - GMAIL_ACCOUNTS=email1:password1,email2:password2")
+    print("  - EMAIL_USER=email and EMAIL_PASSWORD=password (single account)")
+    sys.exit(1)
 
 missing_vars = [var for var, value in required_vars.items() if not value]
 if missing_vars:

@@ -51,24 +51,27 @@ class EmailMonitor:
         self._validate_config()
 
         self.imap_server = config.IMAP_SERVER
-        self.email_user = config.EMAIL_USER
-        self.email_password = config.EMAIL_PASSWORD
+        self.accounts = config.ACCOUNTS  # Dictionary of email:password pairs
         self.telegram_bot_token = config.TELEGRAM_BOT_TOKEN
         self.telegram_chat_id = config.TELEGRAM_CHAT_ID
         self.monitored_senders = [sender.lower() for sender in config.MONITORED_SENDERS]
         self.telegram_url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
 
-        # File to store processed email IDs
+        # File to store processed email IDs (per account)
         self.processed_emails_file = "processed_emails.pkl"
         self.processed_emails = self._load_processed_emails()
 
         # Track when monitoring started
         self.start_time = datetime.now(timezone.utc)
+        
+        logger.info(f"Initialized monitoring for {len(self.accounts)} Gmail account(s)")
+        for email in self.accounts.keys():
+            logger.info(f"  - {email}")
 
     def _validate_config(self):
         """Validate that all required configuration is present"""
         required_fields = [
-            'IMAP_SERVER', 'EMAIL_USER', 'EMAIL_PASSWORD',
+            'IMAP_SERVER', 'ACCOUNTS', 
             'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'MONITORED_SENDERS'
         ]
 
@@ -85,11 +88,19 @@ class EmailMonitor:
             print("Please check your config.py file and ensure all fields are filled in.")
             sys.exit(1)
 
-        # Validate email format
-        if '@' not in config.EMAIL_USER:
-            logger.error("EMAIL_USER must be a valid email address")
-            print("ERROR: EMAIL_USER must be a valid email address")
+        # Validate accounts
+        if not config.ACCOUNTS:
+            logger.error("No Gmail accounts configured")
+            print("ERROR: No Gmail accounts configured")
+            print("Please set GMAIL_ACCOUNTS or EMAIL_USER/EMAIL_PASSWORD")
             sys.exit(1)
+
+        # Validate email format for all accounts
+        for email in config.ACCOUNTS.keys():
+            if '@' not in email:
+                logger.error(f"Invalid email address: {email}")
+                print(f"ERROR: Invalid email address: {email}")
+                sys.exit(1)
 
         # Validate monitored senders
         if not config.MONITORED_SENDERS or len(config.MONITORED_SENDERS) == 0:
@@ -129,15 +140,15 @@ class EmailMonitor:
             logger.warning(f"Could not parse email date: {e}")
             return None
         
-    def connect_to_email(self):
-        """Connect to Gmail IMAP server"""
+    def connect_to_email(self, email_user, email_password):
+        """Connect to Gmail IMAP server for a specific account"""
         try:
             mail = imaplib.IMAP4_SSL(self.imap_server)
-            mail.login(self.email_user, self.email_password)
-            logger.info("Successfully connected to Gmail")
+            mail.login(email_user, email_password)
+            logger.info(f"Successfully connected to Gmail for {email_user}")
             return mail
         except Exception as e:
-            logger.error(f"Failed to connect to Gmail: {e}")
+            logger.error(f"Failed to connect to Gmail for {email_user}: {e}")
             return None
     
     def decode_mime_words(self, s):
@@ -268,11 +279,42 @@ class EmailMonitor:
         return False
     
     def check_emails(self):
-        """Check for new emails from monitored senders"""
-        mail = self.connect_to_email()
-        if not mail:
-            return
+        """Check for new emails from monitored senders across all accounts"""
+        total_new_emails = 0
+        
+        # Check each configured Gmail account
+        for email_user, email_password in self.accounts.items():
+            logger.info(f"Checking emails for account: {email_user}")
+            
+            mail = self.connect_to_email(email_user, email_password)
+            if not mail:
+                logger.error(f"Skipping {email_user} due to connection failure")
+                continue
 
+            try:
+                account_emails = self._check_account_emails(mail, email_user)
+                total_new_emails += account_emails
+                
+            except Exception as e:
+                logger.error(f"Error checking emails for {email_user}: {e}")
+            finally:
+                try:
+                    mail.close()
+                    mail.logout()
+                except:
+                    pass
+        
+        # Save processed emails list
+        self._save_processed_emails()
+        
+        if total_new_emails > 0:
+            logger.info(f"Processed {total_new_emails} new emails from monitored senders across all accounts")
+        else:
+            logger.info("No new emails from monitored senders found in any account")
+    def _check_account_emails(self, mail, email_user):
+        """Check emails for a specific account"""
+        new_emails_processed = 0
+        
         try:
             # Select inbox
             mail.select('inbox')
@@ -283,18 +325,18 @@ class EmailMonitor:
             status, messages = mail.search(None, f'UNSEEN SINCE {since_date}')
 
             if status != 'OK':
-                logger.error("Failed to search for emails")
-                return
+                logger.error(f"Failed to search for emails in {email_user}")
+                return 0
 
             email_ids = messages[0].split()
-            logger.info(f"Found {len(email_ids)} unread emails")
-
-            new_emails_processed = 0
+            logger.info(f"Found {len(email_ids)} unread emails in {email_user}")
 
             for email_id in email_ids:
                 try:
+                    # Create unique email ID with account prefix
+                    email_id_str = f"{email_user}:{email_id.decode() if isinstance(email_id, bytes) else str(email_id)}"
+                    
                     # Skip if we've already processed this email
-                    email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
                     if email_id_str in self.processed_emails:
                         continue
 
@@ -323,18 +365,20 @@ class EmailMonitor:
                     sender_email_lower = sender_email.lower()
 
                     if any(monitored in sender_email_lower for monitored in self.monitored_senders):
-                        logger.info(f"Processing email from {sender_email}: {subject}")
+                        logger.info(f"Processing email from {sender_email} in {email_user}: {subject}")
                         
                         # Extract text content
                         text_content = self.extract_text_content(msg)
                         
-                        # Prepare Telegram message (escape HTML characters)
+                        # Prepare Telegram message with account identification
                         import html
                         safe_sender = html.escape(sender)
                         safe_subject = html.escape(subject)
                         safe_content = html.escape(text_content[:3000])
+                        safe_account = html.escape(email_user)
 
                         telegram_message = f"<b>📧 New Email Alert</b>\n\n"
+                        telegram_message += f"<b>📮 Account:</b> {safe_account}\n"
                         telegram_message += f"<b>From:</b> {safe_sender}\n"
                         telegram_message += f"<b>Subject:</b> {safe_subject}\n\n"
                         telegram_message += f"<b>Content:</b>\n{safe_content}"
@@ -353,13 +397,12 @@ class EmailMonitor:
                             logger.info(f"Email processed and marked as read: {subject}")
                         else:
                             # If Telegram fails, still mark as processed to avoid infinite retries
-                            # But don't mark as read in case we want to retry later
                             self.processed_emails.add(email_id_str)
                             logger.warning(f"Telegram delivery failed for email: {subject}")
                             logger.warning("Email marked as processed to prevent spam, but not marked as read")
                             
                             # Send a simplified retry notification if possible
-                            simple_msg = f"⚠️ Email delivery failed\nFrom: {sender}\nSubject: {subject}\nCheck logs for details."
+                            simple_msg = f"⚠️ Email delivery failed\n📮 Account: {email_user}\nFrom: {sender}\nSubject: {subject}\nCheck logs for details."
                             if self.send_telegram_message(simple_msg):
                                 logger.info("Sent simplified failure notification")
                     else:
@@ -367,26 +410,13 @@ class EmailMonitor:
                         self.processed_emails.add(email_id_str)
 
                 except Exception as e:
-                    logger.error(f"Error processing email {email_id}: {e}")
+                    logger.error(f"Error processing email {email_id} in {email_user}: {e}")
                     continue
-
-            # Save processed emails list
-            self._save_processed_emails()
-
-            if new_emails_processed > 0:
-                logger.info(f"Processed {new_emails_processed} new emails from monitored senders")
-            else:
-                logger.info("No new emails from monitored senders found")
-            
-        except Exception as e:
-            logger.error(f"Error checking emails: {e}")
         
-        finally:
-            try:
-                mail.close()
-                mail.logout()
-            except:
-                pass
+        except Exception as e:
+            logger.error(f"Error checking emails for {email_user}: {e}")
+            
+        return new_emails_processed
     
     def test_network_connectivity(self):
         """Test network connectivity to external services"""
@@ -417,8 +447,11 @@ class EmailMonitor:
             # Prepare startup message
             startup_msg = "🚀 <b>Email Monitor Started!</b>\n\n"
             startup_msg += f"⏰ <b>Started at:</b> {current_time}\n"
-            startup_msg += f"📧 <b>Monitoring Gmail:</b> {html.escape(self.email_user)}\n"
-            startup_msg += f"🔍 <b>Check Interval:</b> {getattr(config, 'CHECK_INTERVAL_MINUTES', 3)} minutes\n\n"
+            startup_msg += f"📧 <b>Monitoring {len(self.accounts)} Gmail Account(s):</b>\n"
+            for email in self.accounts.keys():
+                safe_email = html.escape(email)
+                startup_msg += f"• {safe_email}\n"
+            startup_msg += f"\n🔍 <b>Check Interval:</b> {getattr(config, 'CHECK_INTERVAL_MINUTES', 3)} minutes\n\n"
             startup_msg += "<b>📋 Monitored Senders:</b>\n"
             
             for sender in config.MONITORED_SENDERS:
