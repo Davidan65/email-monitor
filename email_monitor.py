@@ -481,36 +481,40 @@ class EmailMonitor:
         """Initialize monitoring by marking all current unread emails as processed"""
         logger.info("Initializing email monitoring - marking existing emails as processed...")
 
-        mail = self.connect_to_email()
-        if not mail:
-            return False
+        # Initialize for all configured accounts
+        for email_user, email_password in self.accounts.items():
+            logger.info(f"Initializing monitoring for {email_user}...")
+            
+            mail = self.connect_to_email(email_user, email_password)
+            if not mail:
+                logger.error(f"Failed to initialize monitoring for {email_user}")
+                continue
 
-        try:
-            mail.select('inbox')
-
-            # Get all unread emails
-            status, messages = mail.search(None, 'UNSEEN')
-            if status == 'OK':
-                email_ids = messages[0].split()
-                for email_id in email_ids:
-                    email_id_str = email_id.decode() if isinstance(email_id, bytes) else str(email_id)
-                    self.processed_emails.add(email_id_str)
-
-                self._save_processed_emails()
-                logger.info(f"Marked {len(email_ids)} existing unread emails as processed")
-                logger.info("Email monitoring initialized - will now only process NEW emails")
-                return True
-        except Exception as e:
-            logger.error(f"Error during initialization: {e}")
-            return False
-        finally:
             try:
-                mail.close()
-                mail.logout()
-            except:
-                pass
+                mail.select('inbox')
 
-        return False
+                # Get all unread emails
+                status, messages = mail.search(None, 'UNSEEN')
+                if status == 'OK':
+                    email_ids = messages[0].split()
+                    for email_id in email_ids:
+                        email_id_str = f"{email_user}:{email_id.decode() if isinstance(email_id, bytes) else str(email_id)}"
+                        self.processed_emails.add(email_id_str)
+
+                    logger.info(f"Marked {len(email_ids)} existing unread emails as processed for {email_user}")
+                    
+            except Exception as e:
+                logger.error(f"Error during initialization for {email_user}: {e}")
+            finally:
+                try:
+                    mail.close()
+                    mail.logout()
+                except:
+                    pass
+
+        self._save_processed_emails()
+        logger.info("Email monitoring initialized for all accounts - will now only process NEW emails")
+        return True
 
     def run_once(self):
         """Run email check once"""
